@@ -425,6 +425,11 @@ class V2LearningIntegration:
         """Create memory manager based on configured engine."""
         if self._config.memory_engine == "mem0":
             try:
+                import os
+
+                mem0_dir = os.path.join(self._config.data_dir, "mem0")
+                os.makedirs(mem0_dir, exist_ok=True)
+                os.environ.setdefault("MEM0_DIR", mem0_dir)
                 from ..integration import Mem0MemoryManager
                 return Mem0MemoryManager(
                     self._config, self._llm, self._embedding_provider
