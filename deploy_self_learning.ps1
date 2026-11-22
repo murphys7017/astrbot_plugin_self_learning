@@ -69,7 +69,7 @@ function Test-SkippedRelativePath {
 
     $segments = $RelativePath.Replace('/', '\') -split "[\\/]+"
     foreach ($segment in $segments) {
-        if ($segment -in @(".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "tests")) {
+        if ($segment -in @(".git", ".githooks", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "tests")) {
             return $true
         }
     }
@@ -177,7 +177,9 @@ if (Test-Path -LiteralPath $ResolvedTargetPluginRoot -PathType Container) {
 # into the repository. Once imported, source files automatically become managed.
 $RuntimeCompatibilityDirectories = @(".astrbot-plugin", "docs", "pages", "web_src")
 $RuntimeCompatibilityFiles = @(".gitattributes", "ruff.toml")
-$SkipFilePatterns = @("*.pyc", "pytest.ini", "deploy_self_learning.ps1", "source.tar")
+$RuntimeInfrastructureDirectories = @(".githooks")
+$RuntimeInfrastructureFiles = @("DEPLOYMENT.md", "setup_git_hooks.ps1")
+$SkipFilePatterns = @("*.pyc", "pytest.ini", "deploy_self_learning.ps1", "source.tar", "DEPLOYMENT.md", "setup_git_hooks.ps1")
 
 $ManagedRelativeFiles = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
@@ -254,6 +256,12 @@ if (-not $OnlyFiles -and (Test-Path -LiteralPath $ResolvedTargetPluginRoot -Path
     $targetFiles = Get-ChildItem -LiteralPath $ResolvedTargetPluginRoot -Recurse -File
     foreach ($file in $targetFiles) {
         $relativePath = Get-RelativePathCompat -BasePath $ResolvedTargetPluginRoot -TargetPath $file.FullName
+        if ((Test-RelativePathInList -RelativePath $relativePath -Prefixes $RuntimeInfrastructureDirectories) -or ($RuntimeInfrastructureFiles -contains $relativePath)) {
+            Invoke-LoggedAction -Description "Remove deployment infrastructure: $relativePath" -DryRun:$DryRun -Action {
+                Remove-Item -LiteralPath $file.FullName -Force
+            }
+            continue
+        }
         if ($ManagedRelativeFiles.Contains($relativePath) -or (Test-SkippedRelativePath $relativePath)) {
             continue
         }
@@ -270,6 +278,12 @@ if (-not $OnlyFiles -and (Test-Path -LiteralPath $ResolvedTargetPluginRoot -Path
         Sort-Object FullName -Descending
     foreach ($directory in $targetDirectories) {
         $relativePath = Get-RelativePathCompat -BasePath $ResolvedTargetPluginRoot -TargetPath $directory.FullName
+        if (Test-RelativePathInList -RelativePath $relativePath -Prefixes $RuntimeInfrastructureDirectories) {
+            Invoke-LoggedAction -Description "Remove deployment infrastructure directory: $relativePath" -DryRun:$DryRun -Action {
+                Remove-Item -LiteralPath $directory.FullName -Recurse -Force
+            }
+            continue
+        }
         if (Test-SkippedRelativePath $relativePath) {
             continue
         }
