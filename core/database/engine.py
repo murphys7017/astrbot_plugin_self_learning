@@ -136,7 +136,11 @@ class DatabaseEngine:
             pool_size=5,
             max_overflow=10,
             pool_recycle=3600,
-            pool_pre_ping=True,
+            # SQLAlchemy's MySQL dialect calls ping() without the reconnect
+            # argument, while aiomysql's adapted connection requires it.
+            # Disable dialect-level pre-ping and rely on pool recycling plus
+            # connection error handling for stale connections.
+            pool_pre_ping=False,
             connect_args={
                 'connect_timeout': 10,
                 'charset': 'utf8mb4',
@@ -144,7 +148,7 @@ class DatabaseEngine:
             }
         )
 
-        logger.debug("[DatabaseEngine] MySQL 引擎创建成功 (QueuePool, pre_ping=True)")
+        logger.debug("[DatabaseEngine] MySQL 引擎创建成功 (QueuePool, pre_ping=False)")
         return engine
 
     def _get_engine_for_current_loop(self):
