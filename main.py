@@ -62,6 +62,7 @@ class SelfLearningPlugin(star.Star):
         self.db_manager = None
         self._pipeline = None
         self._hook_handler = None
+        self._prompt_snapshot_collector = None
         self._command_handlers = None
         self._command_filter = None
         self.qq_filter = None
@@ -220,7 +221,7 @@ class SelfLearningPlugin(star.Star):
 
     @filter.on_llm_request()
     async def inject_diversity_to_llm_request(self, event: AstrMessageEvent, req=None):
-        """LLM Hook — inject diversity, social context, V2, jargon into request."""
+        """LLM Hook — schedule dynamic context refresh for the next Prompt."""
         handler = getattr(self, '_hook_handler', None)
         if handler:
             await handler.handle(event, req)

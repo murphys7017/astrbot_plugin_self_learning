@@ -166,6 +166,9 @@ class PluginLifecycle:
             from ..services.learning.realtime_processor import RealtimeProcessor
             from ..services.learning.group_orchestrator import GroupLearningOrchestrator
             from ..services.hooks.llm_hook_handler import LLMHookHandler
+            from ..services.hooks.prompt_snapshot import (
+                SelfLearningPromptSnapshotCollector,
+            )
 
             p._dialog_analyzer = DialogAnalyzer(p.factory_manager, p.db_manager)
             p._realtime_processor = RealtimeProcessor(
@@ -196,7 +199,10 @@ class PluginLifecycle:
                 perf_tracker=p._perf_tracker,
                 group_id_to_unified_origin=group_id_to_unified_origin,
                 db_manager=getattr(p, "db_manager", None),
+                context=context,
             )
+            p._prompt_snapshot_collector = SelfLearningPromptSnapshotCollector()
+            context.register_prompt_extension_collector(p._prompt_snapshot_collector)
 
             # ------ 消息处理流水线 ------
             from ..services.learning.message_pipeline import MessagePipeline
@@ -422,6 +428,22 @@ class PluginLifecycle:
 
             # 0. 阻止新消息产生后台任务
             p._shutting_down = True
+
+            # 0.5 停止 Prompt 快照刷新并移除只读 Collector
+            if getattr(p, "_hook_handler", None):
+                await self._safe_step(
+                    "停止 Prompt 快照刷新",
+                    p._hook_handler.shutdown(),
+                )
+            collector = getattr(p, "_prompt_snapshot_collector", None)
+            if collector is not None:
+                remove_collector = getattr(
+                    p.context,
+                    "remove_prompt_extension_collectors_by_module_prefix",
+                    None,
+                )
+                if callable(remove_collector):
+                    remove_collector(type(collector).__module__)
 
             # 1. 停止学习任务
             logger.info("停止所有学习任务...")

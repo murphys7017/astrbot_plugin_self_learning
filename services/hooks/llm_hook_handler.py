@@ -1,9 +1,4 @@
-"""LLM Hook handler — parallel context retrieval, prompt injection, performance tracking.
-
-Orchestrates all context providers (social, V2, diversity, jargon, few-shot, session updates)
-in parallel, merges results, and injects them into the LLM request via
-``extra_user_content_parts`` to preserve system_prompt prefix caching.
-"""
+"""Background context refresh and Prompt snapshot publication."""
 
 import asyncio
 import time
@@ -13,16 +8,12 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..monitoring.instrumentation import monitored
-from astrbot.core.agent.message import TextPart
-
 from .perf_tracker import PerfTracker
+from .prompt_snapshot import publish_prompt_snapshot, scope_for_event
 
 
 class LLMHookHandler:
-    """Orchestrate LLM Hook context injection.
-
-    Runs all context providers in parallel via ``asyncio.gather``, merges
-    results in priority order, and records timing data.
+    """Refresh context sources without blocking the active model request.
 
     Args:
         plugin_config: Plugin configuration object.
@@ -47,6 +38,7 @@ class LLMHookHandler:
         perf_tracker: PerfTracker,
         group_id_to_unified_origin: Dict[str, str],
         db_manager: Any = None,
+        context: Any = None,
     ) -> None:
         self._config = plugin_config
         self._diversity_manager = diversity_manager
@@ -57,121 +49,117 @@ class LLMHookHandler:
         self._perf_tracker = perf_tracker
         self._group_id_to_unified_origin = group_id_to_unified_origin
         self._db_manager = db_manager
+        self._context = context
+        self._refresh_tasks: dict[str, asyncio.Task[None]] = {}
 
     # Public API
 
     @monitored
     async def handle(self, event: AstrMessageEvent, req: Any) -> None:
-        """Process an LLM request hook — inject context into *req*."""
-        hook_start = time.time()
-        social_ms = v2_ms = diversity_ms = jargon_ms = few_shots_ms = 0.0
+        """Schedule context refresh and leave the current request untouched."""
+        del req
+        if self._context is None or scope_for_event(event) is None:
+            return
+        group_id = event.get_group_id() or event.get_sender_id()
+        if getattr(event, "unified_msg_origin", ""):
+            self._group_id_to_unified_origin[group_id] = event.unified_msg_origin
+        key = str(event.unified_msg_origin or event.get_session_id())
+        task = self._refresh_tasks.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self.refresh_snapshot(event),
+                name=f"self-learning-prompt-snapshot:{key[:32]}",
+            )
+            self._refresh_tasks[key] = task
+            task.add_done_callback(
+                lambda done, cache=self._refresh_tasks, cache_key=key: self._finish_refresh_task(
+                    done, cache, cache_key
+                )
+            )
 
-        try:
-            if req is None:
-                logger.warning("[LLM Hook] req 参数为 None，跳过注入")
-                return
+    @staticmethod
+    def _finish_refresh_task(
+        task: asyncio.Task[None],
+        cache: dict[str, asyncio.Task[None]],
+        key: str,
+    ) -> None:
+        if cache.get(key) is task:
+            cache.pop(key, None)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            logger.warning("[LLM Hook] background snapshot refresh failed: %s", exception)
 
-            if not self._diversity_manager:
-                logger.debug("[LLM Hook] diversity_manager未初始化,跳过多样性注入")
-                return
+    async def refresh_snapshot(self, event: AstrMessageEvent) -> None:
+        """Refresh all dynamic context sources in the background."""
+        started = time.perf_counter()
+        group_id = event.get_group_id() or event.get_sender_id()
+        user_id = event.get_sender_id()
+        query = event.get_message_str()
+        results: dict[str, Any] = {}
+        timings: dict[str, float] = {}
 
-            group_id = event.get_group_id() or event.get_sender_id()
-            user_id = event.get_sender_id()
+        async def run(name: str, operation) -> None:
+            source_started = time.perf_counter()
+            try:
+                results[name] = await asyncio.wait_for(
+                    operation(),
+                    timeout=max(0.1, float(getattr(self._config, "llm_hook_context_timeout", 3.0))),
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[LLM Hook] background context timed out source=%s", name)
+                results[name] = None
+            except Exception:
+                logger.debug("[LLM Hook] background context failed source=%s", name, exc_info=True)
+                results[name] = None
+            timings[name] = round((time.perf_counter() - source_started) * 1000, 1)
 
-            # Maintain group_id → unified_msg_origin mapping
-            if hasattr(event, "unified_msg_origin") and event.unified_msg_origin:
-                self._group_id_to_unified_origin[group_id] = event.unified_msg_origin
-                logger.debug(f"[LLM Hook] 更新映射: {group_id} -> {event.unified_msg_origin}")
+        await asyncio.gather(
+            run("social", lambda: self._fetch_social(group_id, user_id)),
+            run("v2", lambda: self._fetch_v2(query, group_id)),
+            run("diversity", lambda: self._fetch_diversity(group_id)),
+            run("jargon", lambda: self._fetch_jargon(event, group_id)),
+            run("few_shots", lambda: self._fetch_few_shots(group_id)),
+        )
 
-            if not req.prompt:
-                logger.debug("[LLM Hook] req.prompt为空,跳过多样性注入")
-                return
-
-            original_prompt_length = len(req.prompt)
+        sections: List[str] = []
+        self._collect_social(results.get("social"), group_id, sections)
+        self._collect_v2(results.get("v2"), timings.get("v2", 0.0), sections)
+        self._collect_diversity(results.get("diversity"), sections)
+        self._collect_jargon(results.get("jargon"), sections)
+        self._collect_few_shots(results.get("few_shots"), sections)
+        self._collect_session_updates(group_id, sections)
+        if not sections:
             logger.debug(
-                f"[LLM Hook] 开始注入多样性增强 "
-                f"(group: {group_id}, 原prompt长度: {original_prompt_length})"
+                "[LLM Hook] background snapshot produced no sections, keeping previous value"
             )
+            return
+        publish_prompt_snapshot(
+            self._context,
+            event,
+            sections=sections,
+            generated_from=query,
+            source_timings_ms=timings,
+        )
+        self._perf_tracker.record(
+            {
+                "ts": time.time(),
+                "total_ms": round((time.perf_counter() - started) * 1000, 1),
+                "group_id": group_id,
+                **{f"{name}_ctx_ms": value for name, value in timings.items()},
+            }
+        )
 
-            prompt_injections: List[str] = []
-            logger.debug("[LLM Hook] 跳过基础人格注入（框架已处理），专注于增量内容")
-
-            # Parallel context retrieval
-            social_result: Optional[str] = None
-            v2_result: Optional[Dict[str, Any]] = None
-            diversity_result: Optional[str] = None
-            jargon_result: Optional[str] = None
-            few_shots_result: Optional[str] = None
-
-            async def _timed_social() -> None:
-                nonlocal social_result, social_ms
-                t0 = time.time()
-                social_result = await self._fetch_social(group_id, user_id)
-                social_ms = (time.time() - t0) * 1000
-
-            async def _timed_v2() -> None:
-                nonlocal v2_result, v2_ms
-                t0 = time.time()
-                v2_result = await self._fetch_v2(req.prompt, group_id)
-                v2_ms = (time.time() - t0) * 1000
-
-            async def _timed_diversity() -> None:
-                nonlocal diversity_result, diversity_ms
-                t0 = time.time()
-                diversity_result = await self._fetch_diversity(group_id)
-                diversity_ms = (time.time() - t0) * 1000
-
-            async def _timed_jargon() -> None:
-                nonlocal jargon_result, jargon_ms
-                t0 = time.time()
-                jargon_result = await self._fetch_jargon(event, group_id)
-                jargon_ms = (time.time() - t0) * 1000
-
-            async def _timed_few_shots() -> None:
-                nonlocal few_shots_result, few_shots_ms
-                t0 = time.time()
-                few_shots_result = await self._fetch_few_shots(group_id)
-                few_shots_ms = (time.time() - t0) * 1000
-
-            await asyncio.gather(
-                _timed_social(),
-                _timed_v2(),
-                _timed_diversity(),
-                _timed_jargon(),
-                _timed_few_shots(),
-            )
-
-            # Merge results in priority order
-            self._collect_social(social_result, group_id, prompt_injections)
-            self._collect_v2(v2_result, v2_ms, prompt_injections)
-            self._collect_diversity(diversity_result, prompt_injections)
-            self._collect_jargon(jargon_result, prompt_injections)
-            self._collect_few_shots(few_shots_result, prompt_injections)
-            self._collect_session_updates(group_id, prompt_injections)
-
-            # Inject into request
-            if prompt_injections:
-                self._inject(req, prompt_injections, hook_start)
-            else:
-                logger.debug("[LLM Hook] 没有可注入的增量内容")
-
-            # Record perf data
-            total_ms = (time.time() - hook_start) * 1000
-            self._perf_tracker.record(
-                {
-                    "ts": time.time(),
-                    "total_ms": round(total_ms, 1),
-                    "social_ctx_ms": round(social_ms, 1),
-                    "v2_ctx_ms": round(v2_ms, 1),
-                    "diversity_ms": round(diversity_ms, 1),
-                    "jargon_ms": round(jargon_ms, 1),
-                    "few_shots_ms": round(few_shots_ms, 1),
-                    "group_id": group_id,
-                }
-            )
-
-        except Exception as e:
-            logger.error(f"[LLM Hook] 框架层面注入多样性失败: {e}", exc_info=True)
+    async def shutdown(self) -> None:
+        """Cancel refreshes owned by this handler."""
+        tasks = list(self._refresh_tasks.values())
+        self._refresh_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # Context fetchers
 
@@ -339,47 +327,3 @@ class LLMHookHandler:
                 logger.debug(f"[LLM Hook] 会话 {group_id} 暂无增量更新")
         except Exception as e:
             logger.warning(f"[LLM Hook] 注入会话级更新失败: {e}")
-
-    # Injection
-
-    def _inject(
-        self, req: Any, injections: List[str], hook_start: float
-    ) -> None:
-        injection_text = "\n\n".join(injections)
-
-        # Use AstrBot's extra_user_content_parts API to inject context.
-        # This keeps system_prompt stable for LLM API prefix caching,
-        # while appending dynamic context as extra content blocks after
-        # the user message.
-        if hasattr(req, "extra_user_content_parts"):
-            req.extra_user_content_parts.append(
-                TextPart(text=f"<context>\n{injection_text}\n</context>")
-            )
-            logger.debug(
-                f"[LLM Hook] extra_user_content_parts 注入完成 - "
-                f"新增: {len(injection_text)} chars"
-            )
-        else:
-            # Fallback for older AstrBot versions without extra_user_content_parts
-            if not req.system_prompt:
-                req.system_prompt = ""
-            req.system_prompt += "\n\n" + injection_text
-            logger.debug(
-                f"[LLM Hook] system_prompt fallback 注入完成 - "
-                f"新增: {len(injection_text)} chars"
-            )
-            logger.warning(
-                "[LLM Hook] 当前 AstrBot 版本不支持 extra_user_content_parts，"
-                "回退到 system_prompt 注入（会影响缓存命中率）"
-            )
-
-        current_style = self._diversity_manager.get_current_style()
-        current_pattern = self._diversity_manager.get_current_pattern()
-        logger.debug(
-            f"[LLM Hook] 当前语言风格: {current_style}, 回复模式: {current_pattern}"
-        )
-        logger.debug(
-            f"[LLM Hook] 注入内容数量: {len(injections)}项, "
-            f"耗时: {time.time() - hook_start:.3f}s"
-        )
-        logger.debug(f"[LLM Hook] 注入内容预览: {injection_text[:200]}...")
