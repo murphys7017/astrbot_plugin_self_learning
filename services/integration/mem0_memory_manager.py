@@ -44,10 +44,15 @@ try:
     from mem0.llms.base import LLMBase
 
     _MEM0_AVAILABLE = True
-except ImportError:
+except Exception as exc:
     Mem0Memory = None # type: ignore[assignment,misc]
     EmbeddingBase = None # type: ignore[assignment,misc]
     LLMBase = None # type: ignore[assignment,misc]
+    logger.debug(
+        "Mem0 optional integration is unavailable during import: %s",
+        exc,
+        exc_info=True,
+    )
 
 
 def _create_framework_embedder(embedding_provider):
